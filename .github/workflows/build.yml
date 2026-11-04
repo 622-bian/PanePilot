@@ -1,0 +1,20 @@
+name: Windows build and tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: powershell
+        run: .\scripts\Build.ps1
+      - name: Test layout and configuration
+        shell: powershell
+        run: .\scripts\Test.ps1

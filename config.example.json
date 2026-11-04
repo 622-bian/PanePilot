@@ -1,0 +1,6 @@
+{
+  "EdgePath": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge_proxy.exe",
+  "ProfileDirectory": "Default",
+  "PwaAppId": "REPLACE_WITH_INSTALLED_PWA_ID",
+  "WindowAppId": "REPLACE_WITH_SHORTCUT_APP_USER_MODEL_ID"
+}

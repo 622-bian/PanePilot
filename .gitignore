@@ -1,0 +1,24 @@
+# Local deployment, earlier prototypes, browser-specific settings, runtime data
+/outputs/
+/work/
+/dist/
+/config.json
+*.local.json
+*.exe
+*.dll
+*.pdb
+*.log
+preload-status.json
+native-layout-result.txt
+bin/
+obj/
+.vs/
+.vscode/
+.idea/
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+Thumbs.db
+.DS_Store
