@@ -26,14 +26,15 @@ internal static class Program
 
     internal static void Launch(WindowSupport.LayoutRequest layout = null)
     {
-        if (layout == null) layout = WindowSupport.CaptureLayoutRequest();
+        // A one-shot process cannot retain undo state; only resident requests may split.
+        if (layout == null) layout = WindowSupport.CaptureLayoutRequest(false);
         Stopwatch watch = Stopwatch.StartNew();
         var existing = new System.Collections.Generic.HashSet<IntPtr>();
         foreach (var info in WindowSupport.Windows()) existing.Add(info.Handle);
         string marker = "panepilot-open-" + Guid.NewGuid().ToString("N");
         LaunchPreloaded(marker, false);
         Log("launch-dispatched ms=" + watch.ElapsedMilliseconds);
-        // Standalone/fallback launches also receive the layout, without touching existing windows.
+        // Resident fallback requests retain their captured foreground and undo capability.
         while (watch.ElapsedMilliseconds < 15000)
         {
             foreach (var info in WindowSupport.Windows())
@@ -78,6 +79,13 @@ internal static class Program
                 else { LoadSettings(); Launch(); }
                 return 0;
             }
+            if (args.Length == 1 && args[0] == "--undo")
+            {
+                EventWaitHandle signal;
+                if (EventWaitHandle.TryOpenExisting(InstanceName + "_Undo", out signal))
+                    using (signal) { signal.Set(); }
+                return 0;
+            }
             if (args.Length == 1 && args[0] == "--stop")
             {
                 EventWaitHandle signal;
@@ -96,7 +104,8 @@ internal static class Program
                     Application.SetCompatibleTextRenderingDefault(false);
                     using (EventWaitHandle stop = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Stop"))
                     using (EventWaitHandle take = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Take"))
-                    using (HotkeyContext context = new HotkeyContext(stop, take))
+                    using (EventWaitHandle undo = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Undo"))
+                    using (HotkeyContext context = new HotkeyContext(stop, take, undo))
                         Application.Run(context);
                 }
                 finally { instance.ReleaseMutex(); }
@@ -126,13 +135,16 @@ internal sealed class HotkeyContext : ApplicationContext
     private bool disposed;
     private readonly PreloadPool pool;
 
-    internal HotkeyContext(EventWaitHandle stop, EventWaitHandle take)
+    internal HotkeyContext(EventWaitHandle stop, EventWaitHandle take, EventWaitHandle undo)
     {
         window = new HotkeyWindow();
         pool = new PreloadPool();
         tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "ChatGPT 新窗口 · Ctrl+Alt+G", Visible = true };
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("新建 ChatGPT 窗口", null, delegate { LaunchSafely(); });
+        ToolStripMenuItem undoItem = new ToolStripMenuItem("撤销上次分屏 · Ctrl+Alt+Shift+G");
+        undoItem.Click += delegate { UndoSafely(); };
+        menu.Items.Add(undoItem);
         ToolStripMenuItem pause = new ToolStripMenuItem("暂停预加载");
         pause.Click += delegate { pause.Text = pool.TogglePause() ? "恢复预加载" : "暂停预加载"; };
         menu.Items.Add(pause);
@@ -140,16 +152,21 @@ internal sealed class HotkeyContext : ApplicationContext
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += delegate { LaunchSafely(); };
         window.Pressed += delegate { LaunchSafely(); };
+        window.UndoPressed += delegate { UndoSafely(); };
         timer = new System.Windows.Forms.Timer { Interval = 100 };
         timer.Tick += delegate
         {
             if (stop.WaitOne(0)) { ExitThread(); return; }
             if (take.WaitOne(0)) LaunchSafely();
+            if (undo.WaitOne(0)) UndoSafely();
+            undoItem.Enabled = WindowSupport.HasSplitUndo;
             pool.Tick();
             tray.Text = "ChatGPT · " + pool.StatusText + " · Ctrl+Alt+G";
         };
         timer.Start();
-        Program.Log("ready pid=" + Process.GetCurrentProcess().Id + " hotkey=Ctrl+Alt+G");
+        Program.Log("ready pid=" + Process.GetCurrentProcess().Id + " hotkey=Ctrl+Alt+G undoHotkey=" + window.UndoAvailable);
+        if (!window.UndoAvailable)
+            tray.ShowBalloonTip(5000,"PanePilot","撤销快捷键被占用，可使用托盘的撤销入口。",ToolTipIcon.Warning);
     }
 
     private void LaunchSafely()
@@ -160,6 +177,12 @@ internal sealed class HotkeyContext : ApplicationContext
             Program.Log("launch-error " + error.Message);
             tray.ShowBalloonTip(5000, "ChatGPT 启动失败", error.Message, ToolTipIcon.Warning);
         }
+    }
+
+    private void UndoSafely()
+    {
+        try { tray.ShowBalloonTip(2500,"PanePilot",WindowSupport.UndoLastSplit(),ToolTipIcon.Info); }
+        catch (Exception error) { Program.Log("undo-error " + error.GetType().Name); }
     }
 
     protected override void Dispose(bool disposing)
@@ -187,6 +210,8 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool UnregisterHotKey(IntPtr window, int id);
     internal event EventHandler Pressed;
+    internal event EventHandler UndoPressed;
+    internal bool UndoAvailable { get; private set; }
 
     internal HotkeyWindow()
     {
@@ -194,7 +219,7 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
         // Ctrl + Alt + G. MOD_NOREPEAT prevents held keys opening many windows.
         for (int attempt = 0; attempt < 30; attempt++)
         {
-            if (RegisterHotKey(Handle, 1, 0x4003, 0x47)) return;
+            if (RegisterHotKey(Handle, 1, 0x4003, 0x47)) break;
             int error = Marshal.GetLastWin32Error();
             if (error != 1409 || attempt == 29)
             {
@@ -203,6 +228,7 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
             }
             Thread.Sleep(500);
         }
+        UndoAvailable=RegisterHotKey(Handle,2,0x4007,0x47);
     }
 
     protected override void WndProc(ref Message message)
@@ -212,12 +238,18 @@ internal sealed class HotkeyWindow : NativeWindow, IDisposable
             EventHandler handler = Pressed;
             if (handler != null) handler(this, EventArgs.Empty);
         }
+        if (message.Msg == 0x0312 && message.WParam.ToInt32() == 2)
+        {
+            EventHandler handler=UndoPressed;
+            if (handler != null) handler(this,EventArgs.Empty);
+        }
         base.WndProc(ref message);
     }
 
     public void Dispose()
     {
         UnregisterHotKey(Handle, 1);
+        if (UndoAvailable) UnregisterHotKey(Handle,2);
         DestroyHandle();
     }
 }

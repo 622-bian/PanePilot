@@ -1,6 +1,6 @@
 # PanePilot · 窗领航
 
-A Windows hotkey helper that preloads one Microsoft Edge ChatGPT web-app window and places new windows on an empty monitor first.
+A Windows hotkey helper that preloads an Edge ChatGPT web-app window, finds free screen space, and supports side-by-side tiling with one-step undo.
 
 按 **Ctrl + Alt + G**，取用提前加载的 ChatGPT Edge 网页应用窗口；有空闲显示器时，优先在那里最大化。
 
@@ -12,15 +12,28 @@ A Windows hotkey helper that preloads one Microsoft Edge ChatGPT web-app window 
 | --- | --- |
 | 存在空闲显示器 | 在空屏最大化，保留标题栏和任务栏 |
 | 多块屏幕都空闲 | 优先当前操作屏，其次主屏 |
-| 没有空屏 | 在按键时的操作屏尝试显示 720×405（16:9） |
-| 单屏 | 空闲时最大化，否则使用 16:9 窗口 |
+| 没有空屏，但有至少 720×405 的空白区域 | 优先在操作屏找空白区域，其次其他屏幕 |
+| 没有足够空白区域 | 将按键时的窗口放到左半屏，新 GPT 放到右半屏 |
+| 不具备安全分屏条件 | 退回普通窗口，不强行调整已有窗口 |
+| 单屏 | 同样依次尝试空屏、空白区域、左右分屏 |
 | 备用窗口尚未就绪 | 普通新建，应用相同布局规则 |
 
 - 最多准备一个备用窗口，取用后补充。
+- **Ctrl+Alt+Shift+G** 撤销最近一次分屏；托盘也提供撤销入口。
 - 托盘支持新建、暂停/恢复预加载和退出。
 - 只在已有 ChatGPT PWA 窗口时预加载；退出时清理未交付的隐藏备用窗口。
-- 不调整已打开的用户窗口，不修改 Windows 全局窗口尺寸或 Edge 安全设置。
-- 当前没有自动分屏、空白矩形搜索或活跃度评分。
+- 分屏只调整按键时的前台窗口和新 GPT，不重排其他应用，不修改 Windows 全局窗口尺寸或 Edge 安全设置。
+- 当前没有活跃度评分或资料屏保护名单。
+
+## 分屏与撤销规则
+
+没有完整空屏时，查找不与普通窗口相交的 720×405 空白矩形；找不到才尝试左右分屏。只分屏可调整大小的普通窗口，跳过工具窗、对话框、最小化窗口和无标题栏的全屏窗口。每列至少 720 像素宽、405 像素高；竖屏或很小的屏幕会退回普通窗口。
+
+按键时保存当前窗口身份和布局；交付前检查它没有被关闭、换成其他窗口、移动或最小化。如果加载期间切到其他应用，也会跳过分屏。应用拒绝半屏大小时撤回本次调整；拒绝调整或恢复的应用会在日志中记录，不能保证所有第三方窗口都能接受布局请求。
+
+撤销恢复最近一次分屏前的位置、尺寸和最大化状态；新 GPT 恢复成普通窗口，**不会关闭或清空对话**。只保留一层撤销，下一次成功分屏会替换记录，助手退出或重启后记录消失。已关闭的窗口不会重新打开；显示器布局发生变化或窗口恢复失败时，保留记录供重试。撤销会覆盖分屏后手动做的窗口位置调整。
+
+这是普通窗口的左右布局，不创建 Windows Snap 分组。`--once` 或助手未运行时的单次启动不分屏，因为进程退出后无法保留撤销记录。
 
 ## 快速开始
 
@@ -49,6 +62,7 @@ Start-Process .\dist\PanePilot.exe
 Start-Process .\dist\PanePilot.exe -ArgumentList '--take'   # 取用/新建
 Start-Process .\dist\PanePilot.exe -ArgumentList '--once'   # 普通新建，不驻留
 Start-Process .\dist\PanePilot.exe -ArgumentList '--stop'   # 停止公开版助手
+Start-Process .\dist\PanePilot.exe -ArgumentList '--undo'   # 撤销常驻助手的最近一次分屏
 $check = Start-Process .\dist\PanePilot.exe -ArgumentList '--check-config' -Wait -PassThru
 $check.ExitCode  # 0 表示本地配置结构和路径检查通过，1 表示失败
 ```
@@ -89,11 +103,24 @@ Start-Process .\dist\tests\NativeLayoutSmoke.exe
 | `src/PreloadPool.cs` | 单个备用窗口的所有权和状态管理 |
 | `src/WindowSupport.cs` | PWA 识别、窗口外观、UI Automation 就绪检查 |
 | `src/WindowLayout.cs` | 桌面快照、布局规则和窗口放置 |
+| `src/SplitLayout.cs` | 前台窗口状态验证、分屏事务、失败回退与撤销 |
 
 布局检测只读取窗口元数据；候选 PWA 就绪检测读取页面地址和输入框是否存在，不读取或记录聊天文本。没有遥测上传。Edge 本身访问 ChatGPT 服务不属于本程序的本地日志机制。
 
+## GitHub 同步
+
+完成代码修改和相关桌面验收后，可执行：
+
+```powershell
+.\scripts\Publish.ps1 -Message "Describe the completed change"
+```
+
+脚本按顺序构建、测试、暂存白名单内的源码与文档、检查常见凭据及个人路径、提交并推送当前分支。要求 Git 已配置身份及远端上游，并已登录 GitHub；推送失败时保留本地提交，不强推。GitHub Actions 随每次推送自动构建和测试，发布完成后还应检查对应运行结果。
+
+这是修改完成时执行的同步流程，不是保存文件就上传的后台监听器；自动检查不能替代人工 diff 审查。项目的 agent 协作规则已要求完成修改后自动执行此流程并检查 CI。
+
 ## 后续方向
 
-先完善空屏识别，再考虑屏幕内空白区域搜索、可撤销的左右分屏、资料屏保护和可配置优先级。低交互不代表可以覆盖：长期展示资料的副屏可能仍在使用。
+继续完善 DPI/应用最小尺寸兼容、资料屏保护和可配置优先级。低交互不代表可以覆盖：长期展示资料的副屏可能仍在使用。
 
 欢迎报告问题或提交小范围 PR，见 [贡献说明](CONTRIBUTING.md)。MIT License，见 [LICENSE](LICENSE)。

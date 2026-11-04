@@ -39,9 +39,12 @@ internal static class LayoutTests
             Check(p.Target.Handle.ToInt64() == 2 && p.Maximize, "occupied main -> empty secondary maximized");
             s.Occupants.Add(R(-1900,10,500,500));
             p = WindowSupport.ChooseLayout(s,new IntPtr(1));
-            Check(p.Target.Handle.ToInt64() == 1 && !p.Maximize, "both busy -> active screen normal");
+            Check(p.Target.Handle.ToInt64() == 2 && p.FreeBounds.HasValue, "occupied primary -> free rectangle on secondary");
             p = WindowSupport.ChooseLayout(s,new IntPtr(2));
-            Check(p.Target.Handle.ToInt64() == 2 && !p.Maximize, "active screen may be secondary");
+            Check(p.Target.Handle.ToInt64() == 2 && p.FreeBounds.HasValue, "active screen free area preferred");
+            s.Occupants.Add(R(-1920,0,1920,1040));
+            p=WindowSupport.ChooseLayout(s,new IntPtr(1));
+            Check(p.Target.Primary && p.WantsSplit && !p.FreeBounds.HasValue, "no empty area -> split candidate on active screen");
             s.Occupants.Clear();
             Check(WindowSupport.ChooseLayout(s,new IntPtr(2)).Target.Handle.ToInt64() == 2, "both empty -> preferred screen");
             Check(WindowSupport.ChooseLayout(s,new IntPtr(99)).Target.Primary, "missing preferred -> primary");
@@ -58,6 +61,7 @@ internal static class LayoutTests
             Check(!WindowSupport.ChooseLayout(s,IntPtr.Zero).Maximize, "incomplete scan never declares empty");
             s.Displays.Clear();
             Check(WindowSupport.ChooseLayout(s,IntPtr.Zero).Target == null, "no displays -> safe fallback");
+            FreeAreaTests();
             foreach (var work in new[] { R(0,0,2560,1392), R(-1920,0,1920,1040), R(0,-1080,1920,1040), R(0,0,640,360) })
             {
                 var r = WindowSupport.PreferredBounds(work);
@@ -118,6 +122,41 @@ internal static class LayoutTests
         }
     }
 
+    private static void FreeAreaTests()
+    {
+        WindowSupport.Rect free,left,right;
+        var obstacles=new System.Collections.Generic.List<WindowSupport.Rect> { R(0,0,800,900) };
+        Check(WindowSupport.TryFindFreeBounds(R(0,0,1920,1080),obstacles,out free)
+            && free.Left >= 800 && !WindowSupport.Overlaps(free,obstacles[0]), "finds a non-overlapping blank rectangle");
+        Check(!WindowSupport.TryFindFreeBounds(R(0,0,700,400),new System.Collections.Generic.List<WindowSupport.Rect>(),out free), "tiny blank space is unusable");
+        obstacles.Add(R(800,0,1120,1080));
+        Check(!WindowSupport.TryFindFreeBounds(R(0,0,1920,1080),obstacles,out free), "thin leftover strip is not enough");
+        Check(WindowSupport.TrySplitBounds(R(-2560,0,2561,1392),out left,out right)
+            && left.Left == -2560 && left.Right == right.Left && right.Right == 1
+            && !WindowSupport.Overlaps(left,right), "odd-width negative-origin split covers monitor without overlap");
+        Check(!WindowSupport.TrySplitBounds(R(0,0,1080,1920),out left,out right), "portrait screen refuses unusably narrow split");
+        var unreliable=Dual(); unreliable.Reliable=false;
+        Check(!WindowSupport.ChooseLayout(unreliable,new IntPtr(1)).WantsSplit
+            && !WindowSupport.ChooseLayout(unreliable,new IntPtr(1)).FreeBounds.HasValue, "incomplete scan never moves existing windows");
+        // Compare the edge-search algorithm with a small exhaustive oracle at one-pixel resolution.
+        var random=new Random(71);
+        for (int trial=0;trial<20;trial++)
+        {
+            var work=R(-20,-15,740,425);
+            var blocks=new System.Collections.Generic.List<WindowSupport.Rect>();
+            for(int i=0;i<3;i++) blocks.Add(R(random.Next(-30,730),random.Next(-25,420),random.Next(1,40),random.Next(1,40)));
+            bool brute=false;
+            for(int y=work.Top;y<=work.Bottom-405;y++)
+                for(int x=work.Left;x<=work.Right-720;x++)
+                {
+                    var candidate=R(x,y,720,405);
+                    if(!blocks.Exists(b=>WindowSupport.Overlaps(candidate,b))) brute=true;
+                }
+            bool found=WindowSupport.TryFindFreeBounds(work,blocks,out free);
+            Check(found == brute && (!found || !blocks.Exists(b=>WindowSupport.Overlaps(free,b))), "free-space search agrees with exhaustive oracle " + trial);
+        }
+    }
+
     private static bool Rejected(Action action)
     {
         try { action(); return false; }
@@ -159,6 +198,7 @@ internal static class NativeLayoutSmoke
                         throw new Exception("Normal bounds differ");
                     File.AppendAllText(result, "PASS monitor=" + d.Handle + " work=" + d.Work.Left + "," + d.Work.Top
                         + "," + d.Work.Right + "," + d.Work.Bottom + " maximize + restore16x9\r\n");
+                    SplitSmoke(form,d,result);
                 }
                 form.Close();
             }
@@ -166,5 +206,51 @@ internal static class NativeLayoutSmoke
             return 0;
         }
         catch (Exception e) { File.AppendAllText(result, "FAIL " + e + "\r\n"); return 1; }
+    }
+
+    private static void SplitSmoke(Form original, WindowSupport.Display display,string result)
+    {
+        WindowSupport.Rect left,right;
+        if(!WindowSupport.TrySplitBounds(display.Work,out left,out right)) return;
+        using(var gpt=new Form { Text="PanePilot split test (temporary)", StartPosition=FormStartPosition.Manual })
+        {
+            IntPtr second=gpt.Handle;
+            var saved=WindowSupport.SaveWindow(original.Handle);
+            if(!WindowSupport.TrySplitPair(saved,second,display,false)) throw new Exception("Normal split failed");
+            WindowSupport.Rect actual;
+            if(!WindowSupport.GetWindowRect(original.Handle,out actual) || !WindowSupport.SameRect(actual,left)) throw new Exception("Original not in left column");
+            if(!WindowSupport.GetWindowRect(second,out actual) || !WindowSupport.SameRect(actual,right)) throw new Exception("GPT not in right column");
+            WindowSupport.UndoLastSplit();
+            if(WindowSupport.HasSplitUndo || !WindowSupport.GetWindowRect(original.Handle,out actual)
+                || !WindowSupport.SameRect(actual,saved.Outer)) throw new Exception("Normal undo failed");
+
+            WindowSupport.ShowWindow(original.Handle,3); Application.DoEvents();
+            saved=WindowSupport.SaveWindow(original.Handle);
+            if(!WindowSupport.TrySplitPair(saved,second,display,false)) throw new Exception("Maximized split failed");
+            WindowSupport.UndoLastSplit();
+            Application.DoEvents();
+            if(WindowSupport.HasSplitUndo || WindowSupport.SaveWindow(original.Handle).Placement.Show != 3) throw new Exception("Maximized undo failed");
+            WindowSupport.ShowWindow(original.Handle,4); Application.DoEvents();
+
+            saved=WindowSupport.SaveWindow(original.Handle);
+            var shifted=saved.Outer; shifted.Left+=20; shifted.Right+=20;
+            WindowSupport.PlaceNormal(original.Handle,shifted);
+            if(WindowSupport.TrySplitPair(saved,second,display,false)) throw new Exception("Stale foreground was moved");
+            WindowSupport.RestoreSaved(saved);
+
+            gpt.MinimumSize=new System.Drawing.Size(display.Work.Right-display.Work.Left,500);
+            saved=WindowSupport.SaveWindow(original.Handle);
+            if(WindowSupport.TrySplitPair(saved,second,display,false)) throw new Exception("Minimum-width failure accepted");
+            if(!WindowSupport.GetWindowRect(original.Handle,out actual) || !WindowSupport.SameRect(actual,saved.Outer)) throw new Exception("Failed split moved original");
+            gpt.MinimumSize=System.Drawing.Size.Empty;
+
+            saved=WindowSupport.SaveWindow(original.Handle);
+            if(!WindowSupport.TrySplitPair(saved,second,display,false)) throw new Exception("Closed-partner setup failed");
+            gpt.Close(); Application.DoEvents();
+            WindowSupport.UndoLastSplit();
+            if(WindowSupport.HasSplitUndo || !WindowSupport.GetWindowRect(original.Handle,out actual)
+                || !WindowSupport.SameRect(actual,saved.Outer)) throw new Exception("Closed-partner undo failed");
+            File.AppendAllText(result,"PASS split + normal/maximized undo + stale target + minimum-width rollback + closed partner monitor=" + display.Handle + "\r\n");
+        }
     }
 }

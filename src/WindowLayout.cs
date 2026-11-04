@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 // Desktop geometry uses physical pixels in the virtual desktop coordinate system.
-// This file never reads window titles/content or moves pre-existing user windows.
+// Does not read window titles/content. Split changes only the captured foreground and new PWA.
 internal static partial class WindowSupport
 {
     internal sealed class Display
@@ -24,6 +24,7 @@ internal static partial class WindowSupport
     internal sealed class LayoutRequest
     {
         internal IntPtr PreferredMonitor;
+        internal SavedWindow Foreground;
     }
 
     internal sealed class LayoutPlan
@@ -31,6 +32,8 @@ internal static partial class WindowSupport
         internal Display Target;
         internal bool Maximize;
         internal int DisplayCount, EmptyCount;
+        internal Rect? FreeBounds;
+        internal bool WantsSplit;
     }
 
     private static readonly object layoutGate = new object();
@@ -59,8 +62,53 @@ internal static partial class WindowSupport
         Display target = choices.Find(display => display.Handle == preferred)
             ?? choices.Find(display => display.Primary)
             ?? (choices.Count == 0 ? null : choices[0]);
-        return new LayoutPlan { Target = target, Maximize = empty.Count > 0,
+        LayoutPlan plan = new LayoutPlan { Target = target, Maximize = empty.Count > 0,
             DisplayCount = snapshot.Displays.Count, EmptyCount = empty.Count };
+        if (empty.Count == 0 && snapshot.Reliable)
+        {
+            List<Display> ordered = new List<Display>(snapshot.Displays);
+            ordered.Sort((a, b) => DisplayPriority(a, preferred).CompareTo(DisplayPriority(b, preferred)));
+            foreach (Display display in ordered)
+            {
+                Rect free;
+                if (!TryFindFreeBounds(display.Work, snapshot.Occupants, out free)) continue;
+                plan.Target = display; plan.FreeBounds = free;
+                return plan;
+            }
+            plan.WantsSplit = target != null;
+        }
+        return plan;
+    }
+
+    private static int DisplayPriority(Display display, IntPtr preferred)
+    {
+        return display.Handle == preferred ? 0 : display.Primary ? 1 : 2;
+    }
+
+    internal static bool TryFindFreeBounds(Rect work, List<Rect> occupants, out Rect result)
+    {
+        // A free fixed-size rectangle can slide left/up until a screen or obstacle edge stops it.
+        // Candidate edges avoid a per-pixel search and keep negative monitor origins meaningful.
+        result = new Rect();
+        const int width = 720, height = 405;
+        var xs = new SortedSet<int> { work.Left };
+        var ys = new SortedSet<int> { work.Top };
+        foreach (Rect rect in occupants)
+        {
+            if (!Overlaps(rect, work)) continue;
+            xs.Add(rect.Right); ys.Add(rect.Bottom);
+        }
+        foreach (int y in ys)
+            foreach (int x in xs)
+            {
+                Rect candidate = new Rect { Left=x, Top=y, Right=x+width, Bottom=y+height };
+                if (candidate.Left < work.Left || candidate.Top < work.Top
+                    || candidate.Right > work.Right || candidate.Bottom > work.Bottom) continue;
+                if (occupants.Exists(rect => Overlaps(rect, candidate))) continue;
+                result = candidate;
+                return true;
+            }
+        return false;
     }
 
     internal static DesktopSnapshot CaptureDesktop(IntPtr excluded)
@@ -105,10 +153,12 @@ internal static partial class WindowSupport
         return snapshot;
     }
 
-    internal static LayoutRequest CaptureLayoutRequest()
+    internal static LayoutRequest CaptureLayoutRequest(bool allowSplit = true)
     {
+        IntPtr foreground = GetForegroundWindow();
         LayoutRequest request = new LayoutRequest {
-            PreferredMonitor = MonitorFromWindow(GetForegroundWindow(), 2) };
+            PreferredMonitor = MonitorFromWindow(foreground, 2),
+            Foreground = allowSplit && IsSplitCandidate(foreground) ? SaveWindow(foreground) : null };
         try
         {
             DesktopSnapshot snapshot = CaptureDesktop(IntPtr.Zero);
@@ -121,7 +171,7 @@ internal static partial class WindowSupport
     private static void LogLayout(string phase, LayoutPlan plan, bool reliable)
     {
         Program.Log("layout-" + phase + " displays=" + plan.DisplayCount + " empty=" + plan.EmptyCount
-            + " reliable=" + reliable + " mode=" + (plan.Maximize ? "empty-maximize" : "normal-16x9")
+            + " reliable=" + reliable + " mode=" + (plan.Maximize ? "empty-maximize" : plan.FreeBounds.HasValue ? "free-space" : plan.WantsSplit ? "split-candidate" : "normal-16x9")
             + " monitor=" + (plan.Target == null ? IntPtr.Zero : plan.Target.Handle));
     }
 
@@ -136,6 +186,8 @@ internal static partial class WindowSupport
                 DesktopSnapshot snapshot = CaptureDesktop(handle);
                 LayoutPlan plan = ChooseLayout(snapshot, request.PreferredMonitor);
                 LogLayout("delivery", plan, snapshot.Reliable);
+                if (plan.WantsSplit && request.Foreground != null
+                    && TrySplitPair(request.Foreground, handle, plan.Target, true)) return true;
                 if (plan.Target != null && PositionNewWindow(handle, plan)) return true;
             }
             catch (Exception error) { Program.Log("layout-apply-error " + error.GetType().Name); }
@@ -147,7 +199,7 @@ internal static partial class WindowSupport
     // Only called for a verified newly-created PWA (or the test harness's own form).
     internal static bool PositionNewWindow(IntPtr handle, LayoutPlan plan)
     {
-        Rect bounds = PreferredBounds(plan.Target.Work);
+        Rect bounds = plan.FreeBounds ?? PreferredBounds(plan.Target.Work);
         if (IsIconic(handle) || IsZoomed(handle)) ShowWindow(handle, 4);
         // Establish normal/restore bounds on the target BEFORE maximizing there.
         if (!SetWindowPos(handle, IntPtr.Zero, bounds.Left, bounds.Top,

@@ -10,6 +10,7 @@
 *.log
 preload-status.json
 native-layout-result.txt
+resident-smoke-result.txt
 bin/
 obj/
 .vs/
