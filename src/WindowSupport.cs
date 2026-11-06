@@ -181,7 +181,7 @@ internal static partial class WindowSupport
     [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr handle);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr handle);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr handle);
-    [DllImport("user32.dll")] private static extern bool IsZoomed(IntPtr handle);
+    [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr handle);
     [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] private static extern bool SetProcessDPIAware();
     [DllImport("user32.dll")] private static extern IntPtr MonitorFromWindow(IntPtr handle, uint flags);

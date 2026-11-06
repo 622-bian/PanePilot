@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -25,6 +26,8 @@ internal static partial class WindowSupport
     {
         internal IntPtr PreferredMonitor;
         internal SavedWindow Foreground;
+        internal DesktopSnapshot Snapshot;
+        internal long SampledAt;
     }
 
     internal sealed class LayoutPlan
@@ -34,6 +37,7 @@ internal static partial class WindowSupport
         internal int DisplayCount, EmptyCount;
         internal Rect? FreeBounds;
         internal bool WantsSplit;
+        internal bool RememberedMaximize;
     }
 
     private static readonly object layoutGate = new object();
@@ -54,7 +58,7 @@ internal static partial class WindowSupport
             && className != "Shell_TrayWnd" && className != "Shell_SecondaryTrayWnd";
     }
 
-    internal static LayoutPlan ChooseLayout(DesktopSnapshot snapshot, IntPtr preferred)
+    internal static LayoutPlan ChooseLayout(DesktopSnapshot snapshot, IntPtr preferred, bool preferMaximized=false)
     {
         List<Display> empty = snapshot.Displays.FindAll(display => snapshot.Reliable
             && !snapshot.Occupants.Exists(rect => Overlaps(rect, display.Work)));
@@ -62,9 +66,10 @@ internal static partial class WindowSupport
         Display target = choices.Find(display => display.Handle == preferred)
             ?? choices.Find(display => display.Primary)
             ?? (choices.Count == 0 ? null : choices[0]);
-        LayoutPlan plan = new LayoutPlan { Target = target, Maximize = empty.Count > 0,
+        LayoutPlan plan = new LayoutPlan { Target = target, Maximize = target!=null && (empty.Count > 0 || preferMaximized),
+            RememberedMaximize=preferMaximized,
             DisplayCount = snapshot.Displays.Count, EmptyCount = empty.Count };
-        if (empty.Count == 0 && snapshot.Reliable)
+        if (empty.Count == 0 && snapshot.Reliable && !preferMaximized)
         {
             List<Display> ordered = new List<Display>(snapshot.Displays);
             ordered.Sort((a, b) => DisplayPriority(a, preferred).CompareTo(DisplayPriority(b, preferred)));
@@ -155,14 +160,18 @@ internal static partial class WindowSupport
 
     internal static LayoutRequest CaptureLayoutRequest(bool allowSplit = true)
     {
+        Stopwatch watch=Stopwatch.StartNew();
         IntPtr foreground = GetForegroundWindow();
         LayoutRequest request = new LayoutRequest {
             PreferredMonitor = MonitorFromWindow(foreground, 2),
-            Foreground = allowSplit && IsSplitCandidate(foreground) ? SaveWindow(foreground) : null };
+            Foreground = allowSplit && !(Program.WindowMode!=null && Program.WindowMode.PreferMaximized)
+                && IsSplitCandidate(foreground) ? SaveWindow(foreground) : null };
         try
         {
-            DesktopSnapshot snapshot = CaptureDesktop(IntPtr.Zero);
-            LogLayout("request", ChooseLayout(snapshot, request.PreferredMonitor), snapshot.Reliable);
+            request.Snapshot=CaptureDesktop(IntPtr.Zero);
+            request.SampledAt=Stopwatch.GetTimestamp();
+            Program.Log("layout-request displays="+request.Snapshot.Displays.Count+" scanMs="+watch.ElapsedMilliseconds
+                +" occupants="+String.Join(",",request.Snapshot.Displays.ConvertAll(d=>request.Snapshot.Occupants.FindAll(r=>Overlaps(r,d.Work)).Count.ToString()).ToArray()));
         }
         catch (Exception error) { Program.Log("layout-scan-error " + error.GetType().Name); }
         return request;
@@ -171,26 +180,39 @@ internal static partial class WindowSupport
     private static void LogLayout(string phase, LayoutPlan plan, bool reliable)
     {
         Program.Log("layout-" + phase + " displays=" + plan.DisplayCount + " empty=" + plan.EmptyCount
-            + " reliable=" + reliable + " mode=" + (plan.Maximize ? "empty-maximize" : plan.FreeBounds.HasValue ? "free-space" : plan.WantsSplit ? "split-candidate" : "normal-16x9")
+            + " reliable=" + reliable + " mode=" + (plan.RememberedMaximize ? "remembered-maximize" : plan.Maximize ? "empty-maximize" : plan.FreeBounds.HasValue ? "free-space" : plan.WantsSplit ? "split-candidate" : "normal-16x9")
             + " monitor=" + (plan.Target == null ? IntPtr.Zero : plan.Target.Handle));
     }
 
     internal static bool ApplyRequestedLayout(IntPtr handle, LayoutRequest request)
     {
         if (!IsWindow(handle) || ReadAppId(handle) != AppId) return false;
+        using(WindowModeTracker.IgnoreChanges(handle))
         lock (layoutGate)
         {
+            Stopwatch watch=Stopwatch.StartNew();
+            bool preferMaximized=Program.WindowMode!=null && Program.WindowMode.PreferMaximized;
             try
             {
-                // Recheck at delivery: loading, rapid presses or unplugging a display can change occupancy.
-                DesktopSnapshot snapshot = CaptureDesktop(handle);
-                LayoutPlan plan = ChooseLayout(snapshot, request.PreferredMonitor);
+                // Reuse only this request's fresh snapshot, never a previous hotkey's state.
+                bool fresh=request.Snapshot!=null && (Stopwatch.GetTimestamp()-request.SampledAt)*1000.0/Stopwatch.Frequency<100;
+                DesktopSnapshot snapshot = fresh ? request.Snapshot : CaptureDesktop(handle);
+                request.Snapshot=null;
+                LayoutPlan plan = ChooseLayout(snapshot, request.PreferredMonitor,preferMaximized);
                 LogLayout("delivery", plan, snapshot.Reliable);
                 if (plan.WantsSplit && request.Foreground != null
                     && TrySplitPair(request.Foreground, handle, plan.Target, true)) return true;
                 if (plan.Target != null && PositionNewWindow(handle, plan)) return true;
             }
             catch (Exception error) { Program.Log("layout-apply-error " + error.GetType().Name); }
+            finally { Program.Log("layout-duration ms="+watch.ElapsedMilliseconds); }
+            if(preferMaximized)
+            {
+                // Do not silently discard the user's preference on a monitor/DPI race.
+                Program.Log("layout-fallback maximize-current-monitor");
+                ShowWindow(handle,3);
+                return IsZoomed(handle);
+            }
             Program.Log("layout-fallback original-16x9");
             return ApplyPreferredBounds(handle);
         }
@@ -200,6 +222,14 @@ internal static partial class WindowSupport
     internal static bool PositionNewWindow(IntPtr handle, LayoutPlan plan)
     {
         Rect bounds = plan.FreeBounds ?? PreferredBounds(plan.Target.Work);
+        if(plan.Maximize && IsZoomed(handle) && MonitorFromWindow(handle,2)==plan.Target.Handle)
+        {
+            // A prepared maximized window on the right screen needs no restore/resize flash.
+            ShowWindow(handle,3);
+            bool maximized=IsZoomed(handle);
+            Program.Log("layout-applied success="+maximized+" maximized=True fast-show=True");
+            return maximized;
+        }
         if (IsIconic(handle) || IsZoomed(handle)) ShowWindow(handle, 4);
         // Establish normal/restore bounds on the target BEFORE maximizing there.
         if (!SetWindowPos(handle, IntPtr.Zero, bounds.Left, bounds.Top,

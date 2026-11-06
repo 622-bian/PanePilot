@@ -15,6 +15,7 @@ internal static class ResidentSmoke
         string root=Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,".."));
         string result=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"resident-smoke-result.txt");
         var forms=new List<Form>();
+        bool restoreMaximum=true, modeChanged=false;
         WindowSupport.EnableDpiAwareness();
         try
         {
@@ -23,6 +24,14 @@ internal static class ResidentSmoke
             File.WriteAllText(result,"Starting resident split/undo integration test\r\n");
             string statusPath=Path.Combine(root,"preload-status.json");
             string before=File.ReadAllText(statusPath);
+            restoreMaximum=!before.Contains("\"mode\":\"automatic\"");
+            using(var automatic=EventWaitHandle.OpenExisting(@"Local\PanePilot_AutomaticMode")) automatic.Set();
+            modeChanged=true;
+            for(int i=0;i<50;i++) {
+                Pump(100);
+                if(File.ReadAllText(statusPath).Contains("\"mode\":\"automatic\"")) break;
+                if(i==49) throw new Exception("Automatic mode was not selected");
+            }
             long previous=Delivered(before);
             using(var take=EventWaitHandle.OpenExisting(@"Local\PanePilot_Take"))
             using(var undo=EventWaitHandle.OpenExisting(@"Local\PanePilot_Undo"))
@@ -85,12 +94,17 @@ internal static class ResidentSmoke
                         && !WindowSupport.SameRect(gptAfter.Outer,right)) { restored=true; break; }
                 }
                 if(!restored) throw new Exception("Resident undo did not restore windows");
+                if(!File.ReadAllText(statusPath).Contains("\"mode\":\"automatic\""))
+                    throw new Exception("Programmatic split/undo changed the user's mode");
                 File.AppendAllText(result,"PASS IPC undo restored original maximized state and kept GPT open\r\n");
             }
             return 0;
         }
         catch(Exception e) { File.AppendAllText(result,"FAIL " + e + "\r\n"); return 1; }
-        finally { foreach(var form in forms) { form.Close(); form.Dispose(); } }
+        finally {
+            foreach(var form in forms) { form.Close(); form.Dispose(); }
+            if(modeChanged) using(var restoreMode=EventWaitHandle.OpenExisting(restoreMaximum ? @"Local\PanePilot_MaximizeMode" : @"Local\PanePilot_AutomaticMode")) restoreMode.Set();
+        }
     }
     private static long Delivered(string status)
     {

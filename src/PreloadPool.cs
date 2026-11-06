@@ -28,11 +28,18 @@ internal sealed class PreloadPool : IDisposable
     private bool scanPending;
     private bool maintenancePending;
     private DateTime nextMaintenance;
+    private readonly PreloadRecovery recovery=new PreloadRecovery();
+    private List<WindowSupport.Info> unresolved=new List<WindowSupport.Info>();
+    private bool unknownFailure;
 
     internal string StatusText
     {
-        get { lock (gate) return paused ? "预加载已暂停" : spare != null && spare.Ready ? "备用窗口已就绪" : pending || spare != null ? "正在预加载" : "等待 PWA 窗口"; }
+        get { lock (gate) return paused ? "预加载已手动暂停" : recovery.Exhausted ? "预加载故障，请手动恢复"
+            : unknownFailure || unresolved.Count>0 ? "等待未确认窗口关闭" : recovery.Failures>0 && !pending ? "预加载等待重试"
+            : spare != null && spare.Ready ? "备用窗口已就绪" : pending || spare != null ? "正在预加载" : "等待 PWA 窗口"; }
     }
+
+    internal bool NeedsResume { get { lock(gate) return paused || recovery.Failures>0; } }
 
     internal PreloadPool()
     {
@@ -78,24 +85,32 @@ internal sealed class PreloadPool : IDisposable
                     finally { lock (gate) { maintenancePending = false; nextMaintenance = DateTime.UtcNow.AddSeconds(5); } }
                 });
             }
-            if (paused || spare != null || pending || scanPending || DateTime.UtcNow < nextAttempt) return;
+            if (paused || recovery.Exhausted || spare != null || pending || scanPending || DateTime.UtcNow < nextAttempt) return;
             scanPending = true;
         }
         Task.Run(delegate
         {
+            List<WindowSupport.Info> before=null;
+            bool attempted=false;
             try
             {
                 List<WindowSupport.Info> windows = WindowSupport.Windows();
                 bool hasUserWindow = windows.Exists(w => w.AppId == WindowSupport.AppId && WindowSupport.IsWindowVisible(w.Handle));
                 lock (gate)
                 {
+                    unresolved.RemoveAll(old=>!windows.Exists(now=>now.Handle==old.Handle && now.ProcessId==old.ProcessId));
+                    if(!recovery.CanAttempt(DateTime.UtcNow,paused,unknownFailure || unresolved.Count>0)) return;
                     if (disposed || paused || !hasUserWindow || spare != null || pending) return;
                     pending = true;
                     directLaunchDuringPrepare = false;
                 }
+                before=windows; attempted=true;
                 Prepare(windows);
             }
-            catch (Exception error) { Program.Log("preload-error " + error.GetType().Name); }
+            catch (Exception error) {
+                Program.Log("preload-error " + error.GetType().Name);
+                if(attempted) RegisterFailure(before,error.GetType().Name);
+            }
             finally
             {
                 lock (gate)
@@ -161,6 +176,7 @@ internal sealed class PreloadPool : IDisposable
                     if (WindowSupport.GetForegroundWindow() == info.Handle && WindowSupport.IsWindow(previousForeground))
                         WindowSupport.SetForegroundWindow(previousForeground);
                     spare = mine;
+                    recovery.Reset(); unresolved.Clear(); unknownFailure=false;
                     // Delay visibility checks until Edge has processed SW_HIDE.
                     nextStatus = DateTime.UtcNow.AddSeconds(1);
                     Program.Log("preload-captured hwnd=" + info.Handle + " ms=" + watch.ElapsedMilliseconds);
@@ -173,9 +189,7 @@ internal sealed class PreloadPool : IDisposable
         }
         if (mine == null)
         {
-            // Stop retrying if ownership could not be proven; never accumulate windows.
-            lock (gate) { paused = true; }
-            Program.Log("preload-paused reason=window-marker-not-found; ordinary-hotkey-still-works");
+            RegisterFailure(before,"window-marker-not-found");
             return;
         }
         while (watch.ElapsedMilliseconds < 60000)
@@ -187,6 +201,7 @@ internal sealed class PreloadPool : IDisposable
                 {
                     WindowSupport.ShowWindow(mine.Handle, 0);
                     WindowSupport.RestorePlacement(mine.Handle, false);
+                    recovery.Reset(); unresolved.Clear(); unknownFailure=false;
                     Program.Log("preload-ready hwnd=" + mine.Handle + " ms=" + watch.ElapsedMilliseconds);
                     WriteStatus();
                     return;
@@ -234,6 +249,7 @@ internal sealed class PreloadPool : IDisposable
         bool sized = WindowSupport.ApplyRequestedLayout(taken.Handle, layout);
         if (!WindowSupport.IsWindowVisible(taken.Handle)) WindowSupport.ShowWindow(taken.Handle, 4);
         bool foreground = WindowSupport.SetForegroundWindow(taken.Handle);
+        if(WindowModeTracker.Active!=null) WindowModeTracker.Active.Track(taken.Handle);
         WindowSupport.Rect deliveredBounds;
         WindowSupport.GetWindowRect(taken.Handle, out deliveredBounds);
         Program.Log("preload-delivered hwnd=" + taken.Handle + " editorReady=" + taken.Ready + " requestMs=" + watch.ElapsedMilliseconds + " foreground=" + foreground + " sized=" + sized + " width=" + (deliveredBounds.Right-deliveredBounds.Left) + " height=" + (deliveredBounds.Bottom-deliveredBounds.Top));
@@ -243,11 +259,29 @@ internal sealed class PreloadPool : IDisposable
     {
         lock (gate)
         {
-            paused = !paused;
+            // The same tray action explicitly resumes a fault pause, without toggling into manual pause.
+            if(!paused && recovery.Failures>0) { recovery.Reset(); unresolved.Clear(); unknownFailure=false; }
+            else paused = !paused;
             if (paused) { CloseSpare(); ReleaseProvisional(); }
             nextAttempt = DateTime.UtcNow;
             WriteStatus();
             return paused;
+        }
+    }
+
+    private void RegisterFailure(List<WindowSupport.Info> before,string reason)
+    {
+        List<WindowSupport.Info> candidates=new List<WindowSupport.Info>();
+        bool unknown=false;
+        try {
+            candidates=WindowSupport.Windows().FindAll(w=>w.AppId==WindowSupport.AppId
+                && (before==null || !before.Exists(old=>old.Handle==w.Handle && old.ProcessId==w.ProcessId)));
+        } catch(Exception) { unknown=true; }
+        lock(gate) {
+            if(disposed || paused) return;
+            unresolved=candidates; unknownFailure=unknown; recovery.Fail(DateTime.UtcNow);
+            Program.Log("preload-fault reason="+reason+" failures="+recovery.Failures
+                +" unresolved="+unresolved.Count+" scanUnknown="+unknown+" exhausted="+recovery.Exhausted);
         }
     }
 
@@ -289,9 +323,12 @@ internal sealed class PreloadPool : IDisposable
     {
         try
         {
-            string state = disposed ? "stopped" : paused ? "paused" : spare != null ? (spare.Ready ? "ready" : "loading") : pending ? "preparing" : "waiting";
+            string state = disposed ? "stopped" : paused ? "paused" : recovery.Exhausted ? "fault-paused"
+                : spare != null ? (spare.Ready ? "ready" : "loading") : pending ? "preparing"
+                : unknownFailure || unresolved.Count>0 ? "waiting-unresolved" : recovery.Failures>0 ? "retry-wait" : "waiting";
             File.WriteAllText(statusPath, "{\"state\":\"" + state + "\",\"pid\":" + Process.GetCurrentProcess().Id +
-                ",\"spareHandle\":" + (spare == null ? 0 : spare.Handle.ToInt64()) + ",\"lastDelivered\":" + lastDelivered + "}");
+                ",\"spareHandle\":" + (spare == null ? 0 : spare.Handle.ToInt64()) + ",\"lastDelivered\":" + lastDelivered
+                + ",\"mode\":\"" + (Program.WindowMode==null || Program.WindowMode.PreferMaximized ? "maximized" : "automatic") + "\"}");
         }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }

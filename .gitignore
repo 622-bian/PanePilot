@@ -4,6 +4,7 @@
 /dist/
 /config.json
 *.local.json
+*.local.json.tmp
 *.exe
 *.dll
 *.pdb
@@ -11,6 +12,7 @@
 preload-status.json
 native-layout-result.txt
 resident-smoke-result.txt
+preference-smoke-result.txt
 bin/
 obj/
 .vs/

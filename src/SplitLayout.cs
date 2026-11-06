@@ -108,6 +108,8 @@ internal static partial class WindowSupport
 
     internal static bool TrySplitPair(SavedWindow original, IntPtr gpt, Display display, bool checkForeground)
     {
+        using(WindowModeTracker.IgnoreChanges(original==null ? IntPtr.Zero : original.Handle))
+        using(WindowModeTracker.IgnoreChanges(gpt))
         lock (layoutGate)
         {
             Rect left,right;
@@ -152,6 +154,8 @@ internal static partial class WindowSupport
 
     internal static bool RestoreSaved(SavedWindow saved)
     {
+        using(WindowModeTracker.IgnoreChanges(saved==null ? IntPtr.Zero : saved.Handle))
+        {
         if (!SameWindow(saved)) return true; // Closed windows are not recreated; reused handles are never touched.
         if (!SameDisplay(saved)) return false;
         // WINDOWPLACEMENT uses workspace coordinates. Pass it back unchanged, not to SetWindowPos.
@@ -160,6 +164,7 @@ internal static partial class WindowSupport
         Placement actual=new Placement { Length=Marshal.SizeOf(typeof(Placement)) };
         return GetWindowPlacement(saved.Handle,ref actual) && actual.Show == saved.Placement.Show
             && SameRect(actual.Normal,saved.Placement.Normal);
+        }
     }
 
     internal static string UndoLastSplit()

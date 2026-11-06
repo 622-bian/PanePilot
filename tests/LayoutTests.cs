@@ -33,6 +33,7 @@ internal static class LayoutTests
         try
         {
             SettingsTests();
+            PreferenceTests.Run();
             var s = Dual();
             s.Occupants.Add(R(0,0,2560,1400));
             var p = WindowSupport.ChooseLayout(s, new IntPtr(1));

@@ -11,6 +11,7 @@ internal static class Program
 {
     private const string InstanceName = @"Local\PanePilot";
     internal static readonly string LogPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "launcher.log");
+    internal static WindowModeStore WindowMode;
 
     internal static void Log(string message)
     {
@@ -28,6 +29,7 @@ internal static class Program
     {
         // A one-shot process cannot retain undo state; only resident requests may split.
         if (layout == null) layout = WindowSupport.CaptureLayoutRequest(false);
+        layout.Snapshot=null; // Cold launches wait for Edge; refresh again at delivery.
         Stopwatch watch = Stopwatch.StartNew();
         var existing = new System.Collections.Generic.HashSet<IntPtr>();
         foreach (var info in WindowSupport.Windows()) existing.Add(info.Handle);
@@ -45,7 +47,8 @@ internal static class Program
                     bool editor;
                     if (WindowSupport.MatchesMarker(info.Handle, marker, out editor))
                     {
-                        Log("normal-window-sized success=" + WindowSupport.ApplyRequestedLayout(info.Handle, layout));
+                        Log("normal-window-sized pid="+Process.GetCurrentProcess().Id+" hwnd="+info.Handle+" success=" + WindowSupport.ApplyRequestedLayout(info.Handle, layout));
+                        if(WindowModeTracker.Active!=null) WindowModeTracker.Active.Track(info.Handle);
                         return;
                     }
                 }
@@ -70,6 +73,15 @@ internal static class Program
         try
         {
             if (args.Length == 1 && args[0] == "--check-config") { LoadSettings(); return 0; }
+            if(args.Length==1 && (args[0]=="--maximize-mode" || args[0]=="--automatic-mode"))
+            {
+                bool maximize=args[0]=="--maximize-mode";
+                EventWaitHandle signal;
+                if(EventWaitHandle.TryOpenExisting(InstanceName+(maximize ? "_MaximizeMode" : "_AutomaticMode"),out signal))
+                    using(signal) signal.Set();
+                else { LoadSettings(); WindowMode.Set(maximize,"command"); }
+                return 0;
+            }
             if (args.Length == 1 && args[0] == "--once") { LoadSettings(); Launch(); return 0; }
             if (args.Length == 1 && args[0] == "--take")
             {
@@ -105,7 +117,9 @@ internal static class Program
                     using (EventWaitHandle stop = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Stop"))
                     using (EventWaitHandle take = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Take"))
                     using (EventWaitHandle undo = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_Undo"))
-                    using (HotkeyContext context = new HotkeyContext(stop, take, undo))
+                    using (EventWaitHandle maximize = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_MaximizeMode"))
+                    using (EventWaitHandle automatic = new EventWaitHandle(false, EventResetMode.AutoReset, InstanceName + "_AutomaticMode"))
+                    using (HotkeyContext context = new HotkeyContext(stop, take, undo, maximize, automatic))
                         Application.Run(context);
                 }
                 finally { instance.ReleaseMutex(); }
@@ -124,6 +138,7 @@ internal static class Program
     private static void LoadSettings()
     {
         AppSettings.Load(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"));
+        WindowMode=new WindowModeStore(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,"window-mode.local.json"));
     }
 }
 
@@ -134,19 +149,26 @@ internal sealed class HotkeyContext : ApplicationContext
     private readonly System.Windows.Forms.Timer timer;
     private bool disposed;
     private readonly PreloadPool pool;
+    private readonly WindowModeTracker modeTracker;
 
-    internal HotkeyContext(EventWaitHandle stop, EventWaitHandle take, EventWaitHandle undo)
+    internal HotkeyContext(EventWaitHandle stop, EventWaitHandle take, EventWaitHandle undo, EventWaitHandle maximize, EventWaitHandle automatic)
     {
         window = new HotkeyWindow();
         pool = new PreloadPool();
+        modeTracker=new WindowModeTracker(Program.WindowMode);
         tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "ChatGPT 新窗口 · Ctrl+Alt+G", Visible = true };
         ContextMenuStrip menu = new ContextMenuStrip();
         menu.Items.Add("新建 ChatGPT 窗口", null, delegate { LaunchSafely(); });
+        var maximizeMode=new ToolStripMenuItem("新窗口：保持最大化");
+        var automaticMode=new ToolStripMenuItem("新窗口：自动布局");
+        maximizeMode.Click+=delegate { SetMode(true); };
+        automaticMode.Click+=delegate { SetMode(false); };
+        menu.Items.Add(maximizeMode); menu.Items.Add(automaticMode);
         ToolStripMenuItem undoItem = new ToolStripMenuItem("撤销上次分屏 · Ctrl+Alt+Shift+G");
         undoItem.Click += delegate { UndoSafely(); };
         menu.Items.Add(undoItem);
         ToolStripMenuItem pause = new ToolStripMenuItem("暂停预加载");
-        pause.Click += delegate { pause.Text = pool.TogglePause() ? "恢复预加载" : "暂停预加载"; };
+        pause.Click += delegate { pool.TogglePause(); };
         menu.Items.Add(pause);
         menu.Items.Add("退出快捷键程序", null, delegate { ExitThread(); });
         tray.ContextMenuStrip = menu;
@@ -157,11 +179,18 @@ internal sealed class HotkeyContext : ApplicationContext
         timer.Tick += delegate
         {
             if (stop.WaitOne(0)) { ExitThread(); return; }
+            if (maximize.WaitOne(0)) SetMode(true);
+            if (automatic.WaitOne(0)) SetMode(false);
             if (take.WaitOne(0)) LaunchSafely();
             if (undo.WaitOne(0)) UndoSafely();
+            modeTracker.Tick();
+            Program.WindowMode.FlushPending(DateTime.UtcNow);
+            maximizeMode.Checked=Program.WindowMode.PreferMaximized;
+            automaticMode.Checked=!maximizeMode.Checked;
             undoItem.Enabled = WindowSupport.HasSplitUndo;
             pool.Tick();
-            tray.Text = "ChatGPT · " + pool.StatusText + " · Ctrl+Alt+G";
+            pause.Text=pool.NeedsResume ? "恢复预加载" : "暂停预加载";
+            tray.Text = "ChatGPT · " + (maximizeMode.Checked ? "最大化 · " : "自动布局 · ") + pool.StatusText;
         };
         timer.Start();
         Program.Log("ready pid=" + Process.GetCurrentProcess().Id + " hotkey=Ctrl+Alt+G undoHotkey=" + window.UndoAvailable);
@@ -171,12 +200,18 @@ internal sealed class HotkeyContext : ApplicationContext
 
     private void LaunchSafely()
     {
-        try { pool.Take(); }
+        try { modeTracker.Tick(); pool.Take(); }
         catch (Exception error)
         {
             Program.Log("launch-error " + error.Message);
             tray.ShowBalloonTip(5000, "ChatGPT 启动失败", error.Message, ToolTipIcon.Warning);
         }
+    }
+
+    private void SetMode(bool maximize)
+    {
+        modeTracker.Tick();
+        Program.WindowMode.Set(maximize,"explicit-choice");
     }
 
     private void UndoSafely()
@@ -193,6 +228,7 @@ internal sealed class HotkeyContext : ApplicationContext
             timer.Stop();
             timer.Dispose();
             pool.Dispose();
+            modeTracker.Dispose();
             tray.Visible = false;
             tray.ContextMenuStrip.Dispose();
             tray.Dispose();
